@@ -4,14 +4,10 @@ general:
   log_level: INFO
 
 llm:
-  provider: openai            # openai | openai_compatible
-  model: gpt-4o-mini
-  base_url: null              # カスタムエンドポイント (null でデフォルト)
-  api_key_env: OPENAI_API_KEY # 環境変数名
-  max_tokens: 1024
-  temperature: 0.0
-  batch_size: 5               # 一度にスコアリングする論文数
-  rate_limit_sec: 1.0         # API呼び出し間隔
+  command: claude                # Claude Code CLI のパス or コマンド名
+  model: opus                   # opus | sonnet | haiku
+  max_tokens: 4096
+  batch_size: 5                 # 一度にスコアリングする論文数
 
 sources:
   arxiv_api:

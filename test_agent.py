@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
 import textwrap
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -11,15 +12,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent import (
-    Agent,
     ArxivApiFetcher,
     Config,
     Database,
     LLMScorer,
     Paper,
     ReportGenerator,
-    RssFetcher,
-    UrlWatcher,
     make_fingerprint,
 )
 
@@ -112,46 +110,48 @@ class TestDatabase:
 # ---------------------------------------------------------------------------
 
 
+VALID_CONFIG_YAML = """\
+general:
+  lookback_days: 7
+  database_path: .agent.db
+  log_level: INFO
+llm:
+  command: claude
+  model: opus
+  batch_size: 5
+sources:
+  arxiv_api:
+    enabled: true
+    category: cs.RO
+    max_results: 200
+  rss:
+    enabled: false
+    feeds: []
+  url_watch:
+    enabled: false
+    targets: []
+scoring:
+  max_score: 10.0
+  min_report_score: 3.0
+  criteria:
+    - name: test
+      description: test criterion
+      max_points: 10.0
+report:
+  output_dir: reports
+  top_n: 15
+  filename_format: "report_{date}.md"
+"""
+
+
 class TestConfig:
     def test_valid_config(self, tmp_path: Path):
         cfg_path = tmp_path / "config.yaml"
-        cfg_path.write_text(
-            textwrap.dedent("""\
-            general:
-              lookback_days: 7
-              database_path: .agent.db
-              log_level: INFO
-            llm:
-              provider: openai
-              model: gpt-4o-mini
-              api_key_env: OPENAI_API_KEY
-            sources:
-              arxiv_api:
-                enabled: true
-                category: cs.RO
-                max_results: 200
-              rss:
-                enabled: false
-                feeds: []
-              url_watch:
-                enabled: false
-                targets: []
-            scoring:
-              max_score: 10.0
-              min_report_score: 3.0
-              criteria:
-                - name: test
-                  description: test criterion
-                  max_points: 10.0
-            report:
-              output_dir: reports
-              top_n: 15
-              filename_format: "report_{date}.md"
-            """),
-            encoding="utf-8",
-        )
+        cfg_path.write_text(VALID_CONFIG_YAML, encoding="utf-8")
         config = Config(str(cfg_path))
         assert config.lookback_days == 7
+        assert config.llm["model"] == "opus"
+        assert config.llm["command"] == "claude"
 
     def test_missing_section(self, tmp_path: Path):
         cfg_path = tmp_path / "config.yaml"
@@ -167,9 +167,8 @@ class TestConfig:
               lookback_days: 7
               database_path: .agent.db
             llm:
-              provider: openai
-              model: gpt-4o-mini
-              api_key_env: OPENAI_API_KEY
+              command: claude
+              model: opus
             sources:
               arxiv_api:
                 enabled: true
@@ -286,7 +285,7 @@ class TestReportGenerator:
 
 
 # ---------------------------------------------------------------------------
-# LLMScorer (mocked)
+# LLMScorer (Claude Code CLI mocked)
 # ---------------------------------------------------------------------------
 
 
@@ -299,11 +298,10 @@ class TestLLMScorer:
               lookback_days: 7
               database_path: .agent.db
             llm:
-              provider: openai
-              model: gpt-4o-mini
-              api_key_env: TEST_API_KEY
+              command: claude
+              model: opus
+              max_tokens: 4096
               batch_size: 2
-              rate_limit_sec: 0
             sources:
               arxiv_api:
                 enabled: false
@@ -334,15 +332,16 @@ class TestLLMScorer:
         )
         return Config(str(cfg_path))
 
-    @patch.dict("os.environ", {"TEST_API_KEY": "sk-test-key"})
-    def test_score_papers(self, tmp_path: Path):
+    @patch("shutil.which", return_value="/usr/bin/claude")
+    @patch("subprocess.run")
+    def test_score_papers(self, mock_run, mock_which, tmp_path: Path):
         config = self._make_config(tmp_path)
         scorer = LLMScorer(config)
 
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = json.dumps(
-            {
+        # Claude Code CLI の --output-format json の応答を模擬
+        cli_response = {
+            "type": "result",
+            "result": json.dumps({
                 "papers": [
                     {
                         "index": 0,
@@ -350,10 +349,11 @@ class TestLLMScorer:
                         "summary": "テスト要約",
                     }
                 ]
-            }
+            }),
+        }
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=json.dumps(cli_response), stderr=""
         )
-        scorer.client = MagicMock()
-        scorer.client.chat.completions.create.return_value = mock_response
 
         paper = Paper(
             fingerprint="abc",
@@ -371,15 +371,22 @@ class TestLLMScorer:
         assert paper.score_detail["code_available"] == 2.0
         assert paper.summary == "テスト要約"
 
-    @patch.dict("os.environ", {"TEST_API_KEY": "sk-test-key"})
-    def test_score_clamped_to_max(self, tmp_path: Path):
+        # CLI が正しい引数で呼ばれたか
+        call_args = mock_run.call_args[0][0]
+        assert "claude" in call_args[0]
+        assert "--print" in call_args
+        assert "--model" in call_args
+        assert "opus" in call_args
+
+    @patch("shutil.which", return_value="/usr/bin/claude")
+    @patch("subprocess.run")
+    def test_score_clamped_to_max(self, mock_run, mock_which, tmp_path: Path):
         config = self._make_config(tmp_path)
         scorer = LLMScorer(config)
 
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = json.dumps(
-            {
+        cli_response = {
+            "type": "result",
+            "result": json.dumps({
                 "papers": [
                     {
                         "index": 0,
@@ -387,10 +394,11 @@ class TestLLMScorer:
                         "summary": "",
                     }
                 ]
-            }
+            }),
+        }
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=json.dumps(cli_response), stderr=""
         )
-        scorer.client = MagicMock()
-        scorer.client.chat.completions.create.return_value = mock_response
 
         paper = Paper(
             fingerprint="abc",
@@ -402,7 +410,99 @@ class TestLLMScorer:
             url="https://example.com",
         )
         scorer.score_papers([paper])
-        # clamped: 2.0 + 2.0 = 4.0, but total capped at max_score=10.0
         assert paper.score_detail["frontier_technology"] == 2.0
         assert paper.score_detail["code_available"] == 2.0
         assert paper.score == 4.0
+
+    @patch("shutil.which", return_value="/usr/bin/claude")
+    @patch("subprocess.run")
+    def test_handles_markdown_wrapped_json(self, mock_run, mock_which, tmp_path: Path):
+        """Claude が ```json ... ``` で囲んで返した場合のパース。"""
+        config = self._make_config(tmp_path)
+        scorer = LLMScorer(config)
+
+        inner_json = json.dumps({
+            "papers": [
+                {
+                    "index": 0,
+                    "scores": {"frontier_technology": 1.0, "code_available": 1.0},
+                    "summary": "要約テスト",
+                }
+            ]
+        })
+        # Claude が markdown code block で返すケース
+        cli_response = {
+            "type": "result",
+            "result": f"以下がスコアリング結果です:\n\n```json\n{inner_json}\n```\n",
+        }
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=json.dumps(cli_response), stderr=""
+        )
+
+        paper = Paper(
+            fingerprint="abc",
+            source="arxiv_api",
+            arxiv_id=None,
+            title="Test",
+            authors="",
+            abstract="Test",
+            url="https://example.com",
+        )
+        scorer.score_papers([paper])
+        assert paper.score == 2.0
+        assert paper.summary == "要約テスト"
+
+    @patch("shutil.which", return_value="/usr/bin/claude")
+    @patch("subprocess.run")
+    def test_cli_error_handled(self, mock_run, mock_which, tmp_path: Path):
+        """CLI がエラーを返した場合、例外を出さず論文のスコアは 0 のまま。"""
+        config = self._make_config(tmp_path)
+        scorer = LLMScorer(config)
+
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="Error occurred"
+        )
+
+        paper = Paper(
+            fingerprint="abc",
+            source="arxiv_api",
+            arxiv_id=None,
+            title="Test",
+            authors="",
+            abstract="",
+            url="https://example.com",
+        )
+        scorer.score_papers([paper])  # should not raise
+        assert paper.score == 0.0
+
+    @patch("shutil.which", return_value=None)
+    def test_missing_cli_raises(self, mock_which, tmp_path: Path):
+        """claude コマンドが見つからない場合に FileNotFoundError。"""
+        config = self._make_config(tmp_path)
+        with pytest.raises(FileNotFoundError, match="claude"):
+            LLMScorer(config)
+
+
+# ---------------------------------------------------------------------------
+# LLMScorer._extract_json
+# ---------------------------------------------------------------------------
+
+
+class TestExtractJson:
+    def test_plain_json(self):
+        result = LLMScorer._extract_json('{"papers": []}')
+        assert result == {"papers": []}
+
+    def test_json_in_code_block(self):
+        text = 'Here is the result:\n\n```json\n{"papers": [{"index": 0}]}\n```\nDone.'
+        result = LLMScorer._extract_json(text)
+        assert result == {"papers": [{"index": 0}]}
+
+    def test_json_with_surrounding_text(self):
+        text = 'The scores are: {"papers": []} and that is all.'
+        result = LLMScorer._extract_json(text)
+        assert result == {"papers": []}
+
+    def test_invalid_json_returns_none(self):
+        result = LLMScorer._extract_json("no json here at all")
+        assert result is None

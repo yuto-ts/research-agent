@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """research-agent: ロボット研究分野の自動リサーチエージェント
 
-arXiv, RSS, 会議ページを巡回し、LLM でスコアリング・要約を行い、
+arXiv, RSS, 会議ページを巡回し、Claude Code CLI でスコアリング・要約を行い、
 週次 Markdown レポートを生成する。
 """
 
@@ -12,20 +12,19 @@ import datetime
 import hashlib
 import json
 import logging
-import os
 import re
+import shutil
 import sqlite3
+import subprocess
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 import feedparser
 import requests
 import yaml
 from bs4 import BeautifulSoup
-from openai import OpenAI
 
 # ---------------------------------------------------------------------------
 # 定数
@@ -538,95 +537,150 @@ class UrlWatcher:
 
 
 # ---------------------------------------------------------------------------
-# LLM Scorer
+# LLM Scorer (Claude Code CLI)
 # ---------------------------------------------------------------------------
 
 
 class LLMScorer:
-    """OpenAI API を使って論文をスコアリング・要約する。"""
+    """Claude Code CLI をサブプロセスとして起動し、論文をスコアリング・要約する。"""
 
     def __init__(self, config: Config) -> None:
         llm_cfg = config.llm
-        api_key = os.environ.get(llm_cfg.get("api_key_env", "OPENAI_API_KEY"), "")
-        if not api_key:
-            raise ValueError(
-                f"環境変数 {llm_cfg.get('api_key_env', 'OPENAI_API_KEY')} が設定されていません"
-            )
-
-        client_kwargs: dict[str, Any] = {"api_key": api_key}
-        if llm_cfg.get("base_url"):
-            client_kwargs["base_url"] = llm_cfg["base_url"]
-
-        self.client = OpenAI(**client_kwargs)
-        self.model: str = llm_cfg.get("model", "gpt-4o-mini")
-        self.max_tokens: int = llm_cfg.get("max_tokens", 1024)
-        self.temperature: float = llm_cfg.get("temperature", 0.0)
+        self.command: str = llm_cfg.get("command", "claude")
+        self.model: str = llm_cfg.get("model", "opus")
+        self.max_tokens: int = llm_cfg.get("max_tokens", 4096)
         self.batch_size: int = llm_cfg.get("batch_size", 5)
-        self.rate_limit: float = llm_cfg.get("rate_limit_sec", 1.0)
 
         self.criteria: list[dict] = config.scoring["criteria"]
         self.max_score: float = config.scoring["max_score"]
+
+        # CLI が利用可能か確認
+        if not shutil.which(self.command):
+            raise FileNotFoundError(
+                f"コマンド '{self.command}' が見つかりません。"
+                f"Claude Code がインストールされているか確認してください。"
+            )
 
     def score_papers(self, papers: list[Paper]) -> list[Paper]:
         """論文リストをバッチでスコアリングし、score / score_detail / summary を設定する。"""
         for i in range(0, len(papers), self.batch_size):
             batch = papers[i : i + self.batch_size]
             self._score_batch(batch)
-            if i + self.batch_size < len(papers):
-                time.sleep(self.rate_limit)
         return papers
 
     def _score_batch(self, batch: list[Paper]) -> None:
-        """1 バッチ分を 1 回の API 呼び出しでスコアリングする。"""
-        system_prompt = self._build_system_prompt()
-        user_prompt = self._build_user_prompt(batch)
+        """1 バッチ分を 1 回の Claude Code CLI 呼び出しでスコアリングする。"""
+        prompt = self._build_prompt(batch)
 
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
+            result = subprocess.run(
+                [
+                    self.command,
+                    "--print",
+                    "--model", self.model,
+                    "--output-format", "json",
+                    "--max-tokens", str(self.max_tokens),
+                    "--dangerously-skip-permissions",
+                    "--no-session-persistence",
+                    prompt,
                 ],
-                max_tokens=self.max_tokens,
-                temperature=self.temperature,
-                response_format={"type": "json_object"},
+                capture_output=True,
+                text=True,
+                timeout=300,
             )
-            content = response.choices[0].message.content or "{}"
-            results = json.loads(content)
-        except Exception as e:
-            logger.error("LLM スコアリング失敗: %s", e)
+
+            if result.returncode != 0:
+                logger.error(
+                    "Claude Code CLI エラー (exit %d): %s",
+                    result.returncode,
+                    result.stderr[:500],
+                )
+                return
+
+            # --output-format json は {"type":"result","result":"..."} を返す
+            output = json.loads(result.stdout)
+            content = output.get("result", "")
+
+            # JSON ブロックを抽出 (```json ... ``` またはそのまま)
+            parsed = self._extract_json(content)
+            if parsed is None:
+                logger.error("Claude Code の応答から JSON をパースできませんでした")
+                logger.debug("応答内容: %s", content[:1000])
+                return
+
+        except subprocess.TimeoutExpired:
+            logger.error("Claude Code CLI がタイムアウトしました")
+            return
+        except (json.JSONDecodeError, KeyError) as e:
+            logger.error("Claude Code CLI の出力パースに失敗: %s", e)
+            logger.debug("stdout: %s", result.stdout[:1000] if result else "")
             return
 
-        papers_results = results.get("papers", [])
-        for paper, result in zip(batch, papers_results):
+        papers_results = parsed.get("papers", [])
+        for paper, paper_result in zip(batch, papers_results):
             detail = {}
             total = 0.0
             for criterion in self.criteria:
                 name = criterion["name"]
-                pts = float(result.get("scores", {}).get(name, 0))
+                pts = float(paper_result.get("scores", {}).get(name, 0))
                 pts = max(0.0, min(pts, criterion["max_points"]))
                 detail[name] = pts
                 total += pts
             paper.score = min(total, self.max_score)
             paper.score_detail = detail
-            paper.summary = result.get("summary", "")
+            paper.summary = paper_result.get("summary", "")
 
-    def _build_system_prompt(self) -> str:
+    @staticmethod
+    def _extract_json(text: str) -> dict | None:
+        """テキストから JSON オブジェクトを抽出する。
+
+        Claude の応答が ```json ... ``` で囲まれている場合と、
+        そのまま JSON の場合の両方に対応する。
+        """
+        # ```json ... ``` ブロックを探す
+        m = re.search(r"```(?:json)?\s*\n?(.*?)```", text, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group(1).strip())
+            except json.JSONDecodeError:
+                pass
+
+        # そのまま JSON として解析を試みる
+        # 最初の { から最後の } までを抽出
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            try:
+                return json.loads(text[start : end + 1])
+            except json.JSONDecodeError:
+                pass
+
+        return None
+
+    def _build_prompt(self, batch: list[Paper]) -> str:
         criteria_text = "\n".join(
             f"  - {c['name']} (0〜{c['max_points']}点): {c['description']}"
             for c in self.criteria
         )
+
+        papers_text = ""
+        for i, paper in enumerate(batch):
+            abstract_short = paper.abstract[:1500] if paper.abstract else "(no abstract)"
+            papers_text += (
+                f"--- Paper {i} ---\n"
+                f"Title: {paper.title}\n"
+                f"Abstract: {abstract_short}\n\n"
+            )
+
         return f"""\
-あなたはロボティクス研究の論文評価アシスタントです。
-与えられた論文のタイトルと abstract を読み、以下の観点でスコアリングしてください。
+以下の論文をスコアリングしてください。
 
 評価基準:
 {criteria_text}
 
-また、各論文について日本語で1〜2文の簡潔な要約を付けてください。
+各論文について日本語で1〜2文の簡潔な要約も付けてください。
 
-出力は必ず以下の JSON 形式で返してください:
+出力は必ず以下の JSON 形式のみで返してください（説明文は不要です）:
 {{
   "papers": [
     {{
@@ -644,18 +698,9 @@ class LLMScorer:
 }}
 
 各スコアは 0 から各基準の max_points の範囲で、0.5 刻みで付けてください。
-根拠が明確でないものは 0 としてください。"""
+根拠が明確でないものは 0 としてください。
 
-    def _build_user_prompt(self, batch: list[Paper]) -> str:
-        parts: list[str] = []
-        for i, paper in enumerate(batch):
-            abstract_short = paper.abstract[:1500] if paper.abstract else "(no abstract)"
-            parts.append(
-                f"--- Paper {i} ---\n"
-                f"Title: {paper.title}\n"
-                f"Abstract: {abstract_short}\n"
-            )
-        return "\n".join(parts)
+{papers_text}"""
 
 
 # ---------------------------------------------------------------------------
@@ -809,7 +854,11 @@ class Agent:
 
             # --- Step 3: LLM スコアリング (新規のみ) ---
             if new_papers:
-                logger.info("LLM スコアリング中 (%d 件)...", len(new_papers))
+                logger.info(
+                    "Claude Code (%s) でスコアリング中 (%d 件)...",
+                    self.scorer.model,
+                    len(new_papers),
+                )
                 self.scorer.score_papers(new_papers)
 
             # --- Step 4: DB 保存 ---
@@ -886,13 +935,24 @@ def main() -> None:
         help="設定ファイルのパス (デフォルト: config.yaml)",
     )
     parser.add_argument(
+        "-m",
+        "--model",
+        choices=["opus", "sonnet", "haiku"],
+        default=None,
+        help="使用するモデル (config.yaml の設定を上書き)",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="レポートを生成せず、取得・スコアリングのみ実行",
     )
     args = parser.parse_args()
 
+    # モデルをコマンドライン引数で上書き
     agent = Agent(config_path=args.config)
+    if args.model:
+        agent.scorer.model = args.model
+
     report_path = agent.run(dry_run=args.dry_run)
     if report_path:
         print(f"レポート: {report_path}")
