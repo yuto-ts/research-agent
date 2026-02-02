@@ -25,9 +25,10 @@ requests>=2.31.0
 PyYAML>=6.0
 beautifulsoup4>=4.12.0
 lxml>=5.0.0
+openai>=1.0.0
 ```
 
-標準ライブラリとして `sqlite3`, `hashlib`, `logging`, `datetime`, `re`, `pathlib`, `argparse`, `textwrap`, `xml.etree.ElementTree` を使用。外部 LLM API は使わない（スコアリングはルールベース）。
+標準ライブラリとして `sqlite3`, `hashlib`, `logging`, `datetime`, `re`, `pathlib`, `argparse`, `xml.etree.ElementTree` を使用。OpenAI API を使った LLM ベースのスコアリング・要約を行う。
 
 ## 3. `.gitignore` への追加項目
 
