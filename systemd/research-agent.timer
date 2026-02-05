@@ -1,0 +1,11 @@
+[Unit]
+Description=Weekly timer for Research Agent
+
+[Timer]
+# 毎週月曜 09:00 JST (00:00 UTC) に実行
+OnCalendar=Mon *-*-* 00:00:00 UTC
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

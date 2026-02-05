@@ -1,0 +1,55 @@
+general:
+  lookback_days: 7
+  database_path: .agent.db
+  log_level: INFO
+
+llm:
+  command: claude                # Claude Code CLI のパス or コマンド名
+  model: opus                   # opus | sonnet | haiku
+  max_tokens: 4096
+  batch_size: 5                 # 一度にスコアリングする論文数
+
+sources:
+  arxiv_api:
+    enabled: true
+    category: "cs.RO"
+    max_results: 200
+    rate_limit_sec: 3.0
+
+  rss:
+    enabled: true
+    feeds:
+      - name: "arXiv cs.RO RSS"
+        url: "https://rss.arxiv.org/rss/cs.RO"
+
+  url_watch:
+    enabled: true
+    targets:
+      - name: "ICRA 2025 Awards"
+        url: "https://2025.ieee-icra.org/awards/"
+        css_selector: "main"
+
+scoring:
+  max_score: 10.0
+  min_report_score: 3.0
+  criteria:
+    - name: frontier_technology
+      description: "先端的な技術 (foundation model, LLM, diffusion, transformer, world model, sim-to-real, NeRF, gaussian splatting, VLA 等) を用いているか"
+      max_points: 2.0
+    - name: code_available
+      description: "GitHub等でコードが公開されている、または公開予定か"
+      max_points: 2.0
+    - name: dataset_benchmark
+      description: "データセットやベンチマークが公開されている、または新しく提案されているか"
+      max_points: 2.0
+    - name: real_world_validation
+      description: "実機ロボットやリアルワールド環境での実験・検証が行われているか"
+      max_points: 2.0
+    - name: safety_robustness
+      description: "安全性、堅牢性、制約順守に関する議論や手法が含まれるか"
+      max_points: 2.0
+
+report:
+  output_dir: reports
+  top_n: 15
+  filename_format: "report_{date}.md"

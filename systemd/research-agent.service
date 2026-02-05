@@ -1,0 +1,28 @@
+[Unit]
+Description=Research Agent - ロボット研究論文の自動リサーチ
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/research-agent
+ExecStart=/opt/research-agent/.venv/bin/python agent.py
+User=research-agent
+Group=research-agent
+
+# 環境変数 (Anthropic API 認証は claude CLI が管理)
+# Environment=ANTHROPIC_API_KEY=sk-...
+
+# ログ
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=research-agent
+
+# セキュリティ
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/research-agent
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
